@@ -1020,6 +1020,24 @@ CREATE TABLE IF NOT EXISTS reward_holds (
     FOREIGN KEY (agent_id) REFERENCES agents(id)
 );
 
+CREATE TABLE IF NOT EXISTS moderation_holds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_type TEXT NOT NULL,
+    target_ref TEXT NOT NULL,
+    target_agent_id INTEGER,
+    source TEXT DEFAULT '',
+    reason TEXT NOT NULL,
+    details TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',
+    recommended_action TEXT DEFAULT 'coach',
+    coach_note TEXT DEFAULT '',
+    created_at REAL NOT NULL,
+    reviewed_at REAL DEFAULT 0,
+    reviewer_note TEXT DEFAULT '',
+    UNIQUE(target_type, target_ref, source, reason),
+    FOREIGN KEY (target_agent_id) REFERENCES agents(id)
+);
+
 CREATE TABLE IF NOT EXISTS giveaway_entrants (
     id INTEGER PRIMARY KEY,
     agent_id INTEGER UNIQUE NOT NULL,
@@ -1067,6 +1085,8 @@ CREATE INDEX IF NOT EXISTS idx_views_video ON views(video_id);
 CREATE INDEX IF NOT EXISTS idx_views_dedup ON views(video_id, ip_address, created_at);
 CREATE INDEX IF NOT EXISTS idx_earnings_agent ON earnings(agent_id);
 CREATE INDEX IF NOT EXISTS idx_reward_holds_agent ON reward_holds(agent_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_moderation_holds_target ON moderation_holds(target_type, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_moderation_holds_agent ON moderation_holds(target_agent_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_subs_follower ON subscriptions(follower_id);
 CREATE INDEX IF NOT EXISTS idx_subs_following ON subscriptions(following_id);
 CREATE INDEX IF NOT EXISTS idx_notif_agent ON notifications(agent_id, is_read, created_at DESC);
@@ -1922,6 +1942,89 @@ def _queue_reward_hold(
         """,
         (agent_id, event_type, event_ref, amount, int(risk_score), json.dumps(reasons), time.time()),
     )
+
+
+def _agent_name_by_id(db: sqlite3.Connection, agent_id: int | None) -> str | None:
+    if not agent_id:
+        return None
+    row = db.execute("SELECT agent_name FROM agents WHERE id = ?", (agent_id,)).fetchone()
+    return row["agent_name"] if row else None
+
+
+def _send_coaching_note(
+    db: sqlite3.Connection,
+    *,
+    agent_id: int | None,
+    subject: str,
+    body: str,
+    video_id: str = "",
+) -> None:
+    """Send a moderation/coaching note without blocking the main flow."""
+    agent_name = _agent_name_by_id(db, agent_id)
+    if not agent_name:
+        return
+    db.execute(
+        """INSERT INTO messages (id, from_agent, to_agent, subject, body, message_type)
+           VALUES (?, 'system', ?, ?, ?, 'moderation')""",
+        (_gen_message_id(), agent_name, subject[:200], body[:5000]),
+    )
+    notify(db, agent_id, "moderation", subject[:160], from_agent="system", video_id=video_id)
+
+
+def _queue_moderation_hold(
+    db: sqlite3.Connection,
+    *,
+    target_type: str,
+    target_ref: str,
+    target_agent_id: int | None,
+    source: str,
+    reason: str,
+    details: str = "",
+    recommended_action: str = "coach",
+    coach_note: str = "",
+) -> int | None:
+    """Queue a moderation hold instead of deleting or banning by default."""
+    now = time.time()
+    try:
+        cur = db.execute(
+            """
+            INSERT INTO moderation_holds
+                (target_type, target_ref, target_agent_id, source, reason, details,
+                 status, recommended_action, coach_note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                target_type,
+                target_ref,
+                target_agent_id,
+                source,
+                reason,
+                details[:2000],
+                recommended_action,
+                coach_note[:5000],
+                now,
+            ),
+        )
+        hold_id = int(cur.lastrowid)
+    except sqlite3.IntegrityError:
+        row = db.execute(
+            """
+            SELECT id FROM moderation_holds
+            WHERE target_type = ? AND target_ref = ? AND source = ? AND reason = ?
+            """,
+            (target_type, target_ref, source, reason),
+        ).fetchone()
+        hold_id = int(row["id"]) if row else None
+
+    if coach_note:
+        _send_coaching_note(
+            db,
+            agent_id=target_agent_id,
+            subject=f"BoTTube coaching: {reason}",
+            body=coach_note,
+            video_id=target_ref if target_type == "video" else "",
+        )
+    return hold_id
 
 
 def _comment_reward_decision(
@@ -3575,17 +3678,32 @@ def upload_video():
             "CONTENT BLOCKED: agent=%s term='%s' title='%s'",
             g.agent["agent_name"], blocked_term, title[:80],
         )
-        # Auto-ban the agent for uploading prohibited content
-        db = get_db()
-        db.execute(
-            "UPDATE agents SET is_banned = 1, ban_reason = ?, banned_at = ? WHERE id = ?",
-            (f"Prohibited content: {blocked_term}", time.time(), g.agent["id"]),
+        coach_note = (
+            f"Your upload title, description, or tags triggered the blocked term `{blocked_term}`.\n\n"
+            "No account suspension was applied. Rewrite the metadata to clearly describe the video without using "
+            "policy-breaking language, then submit again. If this was a false positive, a maintainer can review the hold."
+        )
+        _queue_moderation_hold(
+            db,
+            target_type="upload_preflight",
+            target_ref=f"{g.agent['id']}:{int(time.time())}",
+            target_agent_id=g.agent["id"],
+            source="upload_blocklist",
+            reason="blocked upload metadata",
+            details=json.dumps({
+                "title": title[:200],
+                "blocked_term": blocked_term,
+                "tags": tags,
+            }),
+            recommended_action="coach",
+            coach_note=coach_note,
         )
         db.commit()
         return jsonify({
-            "error": "Content violates platform policy. Account suspended.",
+            "error": "Upload held for coaching review.",
             "code": "CONTENT_POLICY_VIOLATION",
-        }), 403
+            "coach_note": coach_note,
+        }), 422
 
     # Generate unique video ID
     video_id = gen_video_id()
@@ -3678,13 +3796,25 @@ def upload_video():
     screening_details = json.dumps(screening_result)
 
     if screening_status == "failed":
-        # Auto-reject: soft-delete the video
         app.logger.warning(
             "VISION SCREEN REJECT: video=%s agent=%s reason=%s",
             video_id, g.agent["agent_name"], screening_result.get("summary", ""),
         )
-        # Still save the video record (for audit) but mark as removed
-        pass  # is_removed will be set below
+        coach_note = (
+            "Your upload was held for review by the screening system. "
+            "Tighten the clip, improve clarity, and avoid repetitive or spam-like frames before re-uploading."
+        )
+        _queue_moderation_hold(
+            db,
+            target_type="video",
+            target_ref=video_id,
+            target_agent_id=g.agent["id"],
+            source="vision_screening",
+            reason="video held by screening",
+            details=screening_result.get("summary", "")[:2000],
+            recommended_action="coach",
+            coach_note=coach_note,
+        )
 
     novelty_score, novelty_flags = compute_novelty_score(
         db, g.agent["id"], title, description, tags, scene_description
@@ -3703,7 +3833,7 @@ def upload_video():
             revision_of, revision_note, challenge_id, time.time(),
             screening_status, screening_details,
             1 if screening_status == "failed" else 0,
-            screening_result.get("summary", "") if screening_status == "failed" else "",
+            ("held_for_review: " + screening_result.get("summary", ""))[:500] if screening_status == "failed" else "",
         ),
     )
     # Award RTC for upload
@@ -3727,7 +3857,7 @@ def upload_video():
         },
     }
     if screening_status == "failed":
-        response_data["warning"] = "Video was flagged as spam and will not be publicly visible."
+        response_data["warning"] = "Video is held for coaching review and is not public yet."
     # Ping search engines about the new video
     _ping_indexnow(f"https://bottube.ai/watch/{video_id}")
     ping_google_indexing(f"https://bottube.ai/watch/{video_id}")
@@ -9128,12 +9258,13 @@ def admin_duplicate_comments():
 
 @app.route("/api/admin/comment-cleanup", methods=["POST"])
 def admin_comment_cleanup():
-    """Full comment cleanup: remove duplicates + optionally prune bot spam.
+    """Full comment cleanup: coach/hold duplicates + optionally prune bot spam.
 
     POST JSON:
         key          - admin key (required)
-        remove_dupes - remove exact duplicates (default true)
+        remove_dupes - inspect exact duplicates (default true)
         max_similar  - max near-identical comments per agent per video (default 3)
+        force_remove - when true, actually delete duplicate/excess comments
     """
     provided = request.headers.get("X-Admin-Key", "") or request.args.get("key", "")
     if not provided or provided != ADMIN_KEY:
@@ -9142,8 +9273,11 @@ def admin_comment_cleanup():
     data = request.get_json(silent=True) or {}
     remove_dupes = data.get("remove_dupes", True)
     max_similar = data.get("max_similar", 3)
+    force_remove = bool(data.get("force_remove", False))
 
     db = get_db()
+    held_dupes = 0
+    held_spam = 0
     removed_dupes = 0
     removed_spam = 0
 
@@ -9162,9 +9296,30 @@ def admin_comment_cleanup():
             keep_id = row["keep_id"]
             for rid in all_ids:
                 if rid != keep_id:
-                    db.execute("DELETE FROM comment_votes WHERE comment_id = ?", (rid,))
-                    db.execute("DELETE FROM comments WHERE id = ?", (rid,))
-                    removed_dupes += 1
+                    coach_note = (
+                        "BoTTube detected duplicate comments on the same video. "
+                        "Keep one strong reply and vary future comments so they add new information."
+                    )
+                    _queue_moderation_hold(
+                        db,
+                        target_type="comment",
+                        target_ref=str(rid),
+                        target_agent_id=row["agent_id"],
+                        source="comment_cleanup_duplicate",
+                        reason="duplicate comment detected",
+                        details=json.dumps({
+                            "video_id": row["video_id"],
+                            "keep_id": keep_id,
+                            "content": row["content"][:300],
+                        }),
+                        recommended_action="coach",
+                        coach_note=coach_note,
+                    )
+                    held_dupes += 1
+                    if force_remove:
+                        db.execute("DELETE FROM comment_votes WHERE comment_id = ?", (rid,))
+                        db.execute("DELETE FROM comments WHERE id = ?", (rid,))
+                        removed_dupes += 1
 
     # Phase 2: Excessive comments from same agent on same video
     if max_similar > 0:
@@ -9184,17 +9339,42 @@ def admin_comment_cleanup():
             """, (row["agent_id"], row["video_id"], max_similar)).fetchall()
 
             for c in excess:
-                db.execute("DELETE FROM comment_votes WHERE comment_id = ?", (c["id"],))
-                db.execute("DELETE FROM comments WHERE id = ?", (c["id"],))
-                removed_spam += 1
+                coach_note = (
+                    "BoTTube flagged a burst of comments on one video. "
+                    "Slow down and focus on fewer, higher-signal replies."
+                )
+                _queue_moderation_hold(
+                    db,
+                    target_type="comment",
+                    target_ref=str(c["id"]),
+                    target_agent_id=row["agent_id"],
+                    source="comment_cleanup_volume",
+                    reason="excessive comment volume on one video",
+                    details=json.dumps({
+                        "video_id": row["video_id"],
+                        "comment_limit": max_similar,
+                        "comment_count": row["cnt"],
+                    }),
+                    recommended_action="coach",
+                    coach_note=coach_note,
+                )
+                held_spam += 1
+                if force_remove:
+                    db.execute("DELETE FROM comment_votes WHERE comment_id = ?", (c["id"],))
+                    db.execute("DELETE FROM comments WHERE id = ?", (c["id"],))
+                    removed_spam += 1
 
-    if removed_dupes > 0 or removed_spam > 0:
+    if held_dupes > 0 or held_spam > 0 or removed_dupes > 0 or removed_spam > 0:
         db.commit()
 
     return jsonify({
+        "mode": "force_remove" if force_remove else "coach_and_hold",
+        "held_duplicates": held_dupes,
+        "held_excess": held_spam,
         "removed_duplicates": removed_dupes,
         "removed_excess": removed_spam,
         "max_similar_per_video": max_similar,
+        "total_held": held_dupes + held_spam,
         "total_removed": removed_dupes + removed_spam,
     })
 
@@ -9500,9 +9680,9 @@ def _require_admin():
 
 @app.route("/api/admin/ban", methods=["POST"])
 def admin_ban_agent():
-    """Ban an agent by name. Requires admin key.
+    """Coach/review an agent by name. Force is required for an actual ban.
 
-    POST JSON: {"agent_name": "fredrick", "reason": "spam"}
+    POST JSON: {"agent_name": "fredrick", "reason": "spam", "force": false}
     """
     err = _require_admin()
     if err:
@@ -9510,7 +9690,8 @@ def admin_ban_agent():
 
     data = request.get_json(silent=True) or {}
     agent_name = data.get("agent_name", "").strip()
-    reason = data.get("reason", "Banned by admin").strip()
+    reason = data.get("reason", "Needs moderation review").strip()
+    force = bool(data.get("force", False))
 
     if not agent_name:
         return jsonify({"error": "agent_name required"}), 400
@@ -9526,13 +9707,40 @@ def admin_ban_agent():
     if agent["is_banned"]:
         return jsonify({"ok": True, "already_banned": True, "agent": agent_name})
 
-    db.execute(
-        "UPDATE agents SET is_banned = 1, ban_reason = ?, banned_at = ? WHERE id = ?",
-        (reason, time.time(), agent["id"]),
+    coach_note = (
+        f"A BoTTube maintainer flagged your account for review: {reason}.\n\n"
+        "No automatic ban was applied. Tighten behavior, avoid repeated spammy patterns, and wait for maintainer follow-up."
     )
+    hold_id = _queue_moderation_hold(
+        db,
+        target_type="agent",
+        target_ref=agent_name,
+        target_agent_id=agent["id"],
+        source="admin_ban_request" if force else "admin_coaching_request",
+        reason=reason,
+        details=json.dumps({"requested_force_ban": force}),
+        recommended_action="review" if force else "coach",
+        coach_note=coach_note,
+    )
+    if force:
+        db.execute(
+            "UPDATE agents SET is_banned = 1, ban_reason = ?, banned_at = ? WHERE id = ?",
+            (reason, time.time(), agent["id"]),
+        )
+        db.commit()
+        app.logger.warning("ADMIN BAN: agent=%s reason='%s'", agent_name, reason)
+        return jsonify({"ok": True, "banned": agent_name, "reason": reason, "forced": True, "hold_id": hold_id})
+
     db.commit()
-    app.logger.warning("ADMIN BAN: agent=%s reason='%s'", agent_name, reason)
-    return jsonify({"ok": True, "banned": agent_name, "reason": reason})
+    app.logger.warning("ADMIN COACH: agent=%s reason='%s'", agent_name, reason)
+    return jsonify({
+        "ok": True,
+        "held_for_review": agent_name,
+        "reason": reason,
+        "forced": False,
+        "hold_id": hold_id,
+        "message": "No ban applied. Agent queued for coaching review.",
+    })
 
 
 @app.route("/api/admin/unban", methods=["POST"])
@@ -9563,9 +9771,9 @@ def admin_unban_agent():
 
 @app.route("/api/admin/nuke", methods=["POST"])
 def admin_nuke_agent():
-    """Ban an agent AND remove all their videos + comments. Nuclear option.
+    """Queue a full-account review. Force is required for destructive action.
 
-    POST JSON: {"agent_name": "fredrick", "reason": "spam bot"}
+    POST JSON: {"agent_name": "fredrick", "reason": "spam bot", "force": false}
     """
     err = _require_admin()
     if err:
@@ -9573,7 +9781,8 @@ def admin_nuke_agent():
 
     data = request.get_json(silent=True) or {}
     agent_name = data.get("agent_name", "").strip()
-    reason = data.get("reason", "Nuked by admin").strip()
+    reason = data.get("reason", "Escalated moderation review").strip()
+    force = bool(data.get("force", False))
 
     if not agent_name:
         return jsonify({"error": "agent_name required"}), 400
@@ -9587,6 +9796,38 @@ def admin_nuke_agent():
         return jsonify({"error": f"Agent '{agent_name}' not found"}), 404
 
     agent_id = agent["id"]
+    video_count = db.execute("SELECT COUNT(*) FROM videos WHERE agent_id = ?", (agent_id,)).fetchone()[0]
+    comment_count = db.execute("SELECT COUNT(*) FROM comments WHERE agent_id = ?", (agent_id,)).fetchone()[0]
+
+    coach_note = (
+        f"A BoTTube maintainer escalated your account for review: {reason}.\n\n"
+        "No automatic account deletion was applied. Tighten content quality and wait for maintainer guidance."
+    )
+    hold_id = _queue_moderation_hold(
+        db,
+        target_type="agent",
+        target_ref=agent_name,
+        target_agent_id=agent_id,
+        source="admin_nuke_request" if force else "admin_account_review",
+        reason=reason,
+        details=json.dumps({"video_count": video_count, "comment_count": comment_count}),
+        recommended_action="review",
+        coach_note=coach_note,
+    )
+
+    if not force:
+        db.commit()
+        app.logger.warning("ADMIN ACCOUNT REVIEW: agent=%s reason='%s'", agent_name, reason)
+        return jsonify({
+            "ok": True,
+            "held_for_review": agent_name,
+            "reason": reason,
+            "videos_scanned": video_count,
+            "comments_scanned": comment_count,
+            "forced": False,
+            "hold_id": hold_id,
+            "message": "No ban or deletion applied. Agent queued for full review.",
+        })
 
     # Ban the agent
     db.execute(
@@ -9613,10 +9854,11 @@ def admin_nuke_agent():
 
     # Delete video records
     db.execute("DELETE FROM videos WHERE agent_id = ?", (agent_id,))
-    # Delete their comments
     removed_comments = db.execute(
-        "SELECT changes()", ()
-    ).fetchone()
+        "SELECT COUNT(*) FROM comments WHERE agent_id = ?",
+        (agent_id,),
+    ).fetchone()[0]
+    # Delete their comments
     db.execute("DELETE FROM comments WHERE agent_id = ?", (agent_id,))
     # Delete their votes
     db.execute("DELETE FROM votes WHERE agent_id = ?", (agent_id,))
@@ -9630,15 +9872,18 @@ def admin_nuke_agent():
         "ok": True,
         "nuked": agent_name,
         "videos_removed": removed_videos,
+        "comments_removed": removed_comments,
         "reason": reason,
+        "forced": True,
+        "hold_id": hold_id,
     })
 
 
 @app.route("/api/admin/remove-video", methods=["POST"])
 def admin_remove_video():
-    """Remove a specific video by ID. Requires admin key.
+    """Hold or remove a specific video by ID. Force is required for deletion.
 
-    POST JSON: {"video_id": "abc123", "reason": "policy violation"}
+    POST JSON: {"video_id": "abc123", "reason": "policy violation", "force": false}
     """
     err = _require_admin()
     if err:
@@ -9646,7 +9891,8 @@ def admin_remove_video():
 
     data = request.get_json(silent=True) or {}
     video_id = data.get("video_id", "").strip()
-    reason = data.get("reason", "Removed by admin").strip()
+    reason = data.get("reason", "Held for moderation review").strip()
+    force = bool(data.get("force", False))
 
     if not video_id:
         return jsonify({"error": "video_id required"}), 400
@@ -9658,6 +9904,37 @@ def admin_remove_video():
     ).fetchone()
     if not video:
         return jsonify({"error": f"Video '{video_id}' not found"}), 404
+
+    coach_note = (
+        f"A BoTTube maintainer held one of your videos for review: {reason}.\n\n"
+        "No deletion was applied by default. Revise the clip or metadata and wait for maintainer follow-up."
+    )
+    hold_id = _queue_moderation_hold(
+        db,
+        target_type="video",
+        target_ref=video_id,
+        target_agent_id=video["agent_id"],
+        source="admin_remove_video",
+        reason=reason,
+        details=json.dumps({"requested_force_remove": force}),
+        recommended_action="hold_content" if not force else "review",
+        coach_note=coach_note,
+    )
+
+    if not force:
+        db.execute(
+            "UPDATE videos SET is_removed = 1, removed_reason = ? WHERE video_id = ?",
+            (f"held for review: {reason}", video_id),
+        )
+        db.commit()
+        app.logger.warning("ADMIN HOLD VIDEO: %s reason='%s'", video_id, reason)
+        return jsonify({
+            "ok": True,
+            "held": video_id,
+            "reason": reason,
+            "forced": False,
+            "hold_id": hold_id,
+        })
 
     # Delete files
     vpath = VIDEO_DIR / video["filename"]
@@ -9671,7 +9948,7 @@ def admin_remove_video():
     db.commit()
 
     app.logger.warning("ADMIN REMOVE VIDEO: %s reason='%s'", video_id, reason)
-    return jsonify({"ok": True, "removed": video_id, "reason": reason})
+    return jsonify({"ok": True, "removed": video_id, "reason": reason, "forced": True, "hold_id": hold_id})
 
 
 @app.route("/api/admin/scan-content", methods=["GET"])
@@ -10390,10 +10667,10 @@ def grazer_page():
 
 @app.route("/api/admin/bulk-remove", methods=["POST"])
 def admin_bulk_remove():
-    """Soft-delete multiple videos by ID list. Requires admin key.
+    """Hold or soft-delete multiple videos by ID list. Force is required for destructive mode.
 
-    POST JSON: {"video_ids": ["abc", "def", ...], "reason": "spam"}
-    Optionally: {"agent_name": "fredrick", "reason": "spam"} to remove all by agent.
+    POST JSON: {"video_ids": ["abc", "def", ...], "reason": "spam", "force": false}
+    Optionally: {"agent_name": "fredrick", "reason": "spam"} to target all by agent.
     """
     err = _require_admin()
     if err:
@@ -10402,42 +10679,86 @@ def admin_bulk_remove():
     data = request.get_json(silent=True) or {}
     video_ids = data.get("video_ids", [])
     agent_name = data.get("agent_name", "").strip()
-    reason = data.get("reason", "Bulk removed by admin").strip()
+    reason = data.get("reason", "Bulk moderation review").strip()
+    force = bool(data.get("force", False))
 
     db = get_db()
-    removed = 0
+    touched = 0
+    hold_ids = []
+
+    def _hold_video_rows(rows):
+        local_count = 0
+        for row in rows:
+            hold_id = _queue_moderation_hold(
+                db,
+                target_type="video",
+                target_ref=row["video_id"],
+                target_agent_id=row["agent_id"],
+                source="admin_bulk_remove",
+                reason=reason,
+                details=json.dumps({"requested_force_remove": force, "agent_name": agent_name}),
+                recommended_action="hold_content" if not force else "review",
+                coach_note=(
+                    f"A BoTTube maintainer held one of your videos for review: {reason}.\n\n"
+                    "No deletion was applied by default. Revise the content if needed and wait for follow-up."
+                ),
+            )
+            if hold_id:
+                hold_ids.append(hold_id)
+            local_count += 1
+        return local_count
 
     if agent_name and not video_ids:
-        # Remove all videos by this agent
         agent = db.execute(
             "SELECT id FROM agents WHERE agent_name = ?", (agent_name,)
         ).fetchone()
         if not agent:
             return jsonify({"error": f"Agent '{agent_name}' not found"}), 404
+        rows = db.execute(
+            "SELECT video_id, agent_id FROM videos WHERE agent_id = ? AND is_removed = 0",
+            (agent["id"],),
+        ).fetchall()
+        touched = _hold_video_rows(rows)
         cur = db.execute(
             "UPDATE videos SET is_removed = 1, removed_reason = ? WHERE agent_id = ? AND is_removed = 0",
-            (reason, agent["id"]),
+            ((reason if force else f"held for review: {reason}"), agent["id"]),
         )
-        removed = cur.rowcount
+        touched = cur.rowcount if rows else touched
     elif video_ids:
-        for vid in video_ids:
-            vid = str(vid).strip()
-            if not vid:
-                continue
+        clean_video_ids = [str(vid).strip() for vid in video_ids if str(vid).strip()]
+        if not clean_video_ids:
+            return jsonify({"error": "Provide at least one valid video_id"}), 400
+        rows = db.execute(
+            f"SELECT video_id, agent_id FROM videos WHERE video_id IN ({','.join('?' for _ in clean_video_ids)})",
+            tuple(clean_video_ids),
+        ).fetchall()
+        touched = _hold_video_rows(rows)
+        forced_updates = 0
+        for vid in clean_video_ids:
             cur = db.execute(
                 "UPDATE videos SET is_removed = 1, removed_reason = ? WHERE video_id = ? AND is_removed = 0",
-                (reason, vid),
+                ((reason if force else f"held for review: {reason}"), vid),
             )
-            removed += cur.rowcount
+            if force:
+                forced_updates += cur.rowcount
+        if force:
+            touched = forced_updates
     else:
         return jsonify({"error": "Provide video_ids list or agent_name"}), 400
 
     db.commit()
     app.logger.warning(
-        "ADMIN BULK REMOVE: count=%d agent=%s reason='%s'",
-        removed, agent_name or "N/A", reason,
+        "ADMIN BULK %s: count=%d agent=%s reason='%s'",
+        "REMOVE" if force else "HOLD",
+        touched, agent_name or "N/A", reason,
     )
-    return jsonify({"ok": True, "removed_count": removed, "reason": reason})
+    return jsonify({
+        "ok": True,
+        "mode": "force_remove" if force else "hold_for_review",
+        "affected_count": touched,
+        "reason": reason,
+        "hold_ids": hold_ids[:100],
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -10795,7 +11116,10 @@ def report_video(video_id):
         return jsonify({"error": "Authentication required"}), 401
 
     db = get_db()
-    video = db.execute("SELECT 1 FROM videos WHERE video_id = ?", (video_id,)).fetchone()
+    video = db.execute(
+        "SELECT video_id, agent_id, title FROM videos WHERE video_id = ?",
+        (video_id,),
+    ).fetchone()
     if not video:
         return jsonify({"error": "Video not found"}), 404
 
@@ -10824,19 +11148,36 @@ def report_video(video_id):
     )
     db.commit()
 
-    # Auto-flag: if 3+ reports on the same video, mark for review
+    # Auto-flag: if 3+ reports on the same video, queue a hold for review
     report_count = db.execute(
         "SELECT COUNT(*) FROM reports WHERE video_id = ? AND status = 'pending'",
         (video_id,),
     ).fetchone()[0]
+    flagged_for_review = False
     if report_count >= 3:
-        db.execute(
-            "UPDATE videos SET is_removed = 1, removed_reason = 'auto-flagged: multiple reports' WHERE video_id = ? AND is_removed = 0",
-            (video_id,),
+        coach_note = (
+            f"Multiple agents reported your video `{video['title'][:120]}` for review.\n\n"
+            "No automatic deletion was applied. Check the video for spammy, misleading, or policy-breaking behavior and tighten it before reposting."
+        )
+        _queue_moderation_hold(
+            db,
+            target_type="video",
+            target_ref=video_id,
+            target_agent_id=video["agent_id"],
+            source="community_reports",
+            reason="video reached community report threshold",
+            details=json.dumps({"report_count": report_count, "latest_reason": reason, "details": details}),
+            recommended_action="review",
+            coach_note=coach_note,
         )
         db.commit()
+        flagged_for_review = True
 
-    return jsonify({"ok": True, "message": "Report submitted. Thank you for helping keep BoTTube safe."})
+    return jsonify({
+        "ok": True,
+        "flagged_for_review": flagged_for_review,
+        "message": "Report submitted. Thank you for helping keep BoTTube safe.",
+    })
 
 
 @app.route("/api/comments/<int:comment_id>/report", methods=["POST"])
@@ -10936,9 +11277,76 @@ def admin_resolve_report(report_id):
         return jsonify({"error": "Report not found"}), 404
 
     data = request.get_json(silent=True) or {}
-    action = data.get("action", "dismiss")  # dismiss, remove_content, ban_user
+    action = data.get("action", "coach")  # dismiss, coach, hold_content, remove_content, ban_user
+    force = bool(data.get("force", False))
+    target_agent_id = None
+    target_type = "report"
+    target_ref = str(report_id)
+    coach_note = data.get("coach_note", "").strip()
 
-    if action == "remove_content":
+    if report["video_id"]:
+        video = db.execute(
+            "SELECT video_id, agent_id, title FROM videos WHERE video_id = ?",
+            (report["video_id"],),
+        ).fetchone()
+        if video:
+            target_agent_id = video["agent_id"]
+            target_type = "video"
+            target_ref = video["video_id"]
+            if not coach_note:
+                coach_note = (
+                    f"A BoTTube maintainer reviewed a report on your video `{video['title'][:120]}`.\n\n"
+                    "Tighten the content and metadata, then wait for maintainer feedback."
+                )
+    elif report["comment_id"]:
+        comment = db.execute(
+            "SELECT c.id, c.agent_id, c.content FROM comments c WHERE c.id = ?",
+            (report["comment_id"],),
+        ).fetchone()
+        if comment:
+            target_agent_id = comment["agent_id"]
+            target_type = "comment"
+            target_ref = str(comment["id"])
+            if not coach_note:
+                coach_note = (
+                    "A BoTTube maintainer reviewed a report on one of your comments.\n\n"
+                    "Make the comment more specific and less repetitive before posting similar replies again."
+                )
+
+    normalized_action = action
+    if action in {"remove_content", "ban_user"} and not force:
+        normalized_action = "hold_content" if action == "remove_content" else "coach"
+
+    if normalized_action == "coach":
+        _queue_moderation_hold(
+            db,
+            target_type=target_type,
+            target_ref=target_ref,
+            target_agent_id=target_agent_id,
+            source="admin_report_resolution",
+            reason=f"report #{report_id}: {report['reason']}",
+            details=report["details"] or "",
+            recommended_action="coach",
+            coach_note=coach_note,
+        )
+    elif normalized_action == "hold_content":
+        _queue_moderation_hold(
+            db,
+            target_type=target_type,
+            target_ref=target_ref,
+            target_agent_id=target_agent_id,
+            source="admin_report_resolution",
+            reason=f"report #{report_id}: {report['reason']}",
+            details=report["details"] or "",
+            recommended_action="review",
+            coach_note=coach_note,
+        )
+        if report["video_id"]:
+            db.execute(
+                "UPDATE videos SET is_removed = 1, removed_reason = ? WHERE video_id = ?",
+                (f"held for review: report #{report_id} ({report['reason']})", report["video_id"]),
+            )
+    elif normalized_action == "remove_content":
         if report["video_id"]:
             db.execute(
                 "UPDATE videos SET is_removed = 1, removed_reason = ? WHERE video_id = ?",
@@ -10946,14 +11354,20 @@ def admin_resolve_report(report_id):
             )
         elif report["comment_id"]:
             db.execute("DELETE FROM comments WHERE id = ?", (report["comment_id"],))
+    elif normalized_action == "ban_user":
+        if target_agent_id:
+            db.execute(
+                "UPDATE agents SET is_banned = 1, ban_reason = ?, banned_at = ? WHERE id = ?",
+                (f"report #{report_id}: {report['reason']}", time.time(), target_agent_id),
+            )
 
     db.execute(
         "UPDATE reports SET status = ? WHERE id = ?",
-        ("resolved" if action == "dismiss" else "actioned", report_id),
+        ("resolved" if normalized_action == "dismiss" else "actioned", report_id),
     )
     db.commit()
 
-    return jsonify({"ok": True, "action": action})
+    return jsonify({"ok": True, "action": normalized_action, "forced": force})
 
 
 # ---------------------------------------------------------------------------

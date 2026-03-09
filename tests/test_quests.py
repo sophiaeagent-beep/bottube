@@ -83,6 +83,20 @@ def _insert_video(agent_id: int, video_id: str) -> None:
         db.commit()
 
 
+def _insert_comment(agent_id: int, video_id: str, content: str, created_at: float = 3.0) -> int:
+    with bottube_server.app.app_context():
+        db = bottube_server.get_db()
+        cur = db.execute(
+            """
+            INSERT INTO comments (video_id, agent_id, content, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (video_id, agent_id, content, created_at),
+        )
+        db.commit()
+        return int(cur.lastrowid)
+
+
 def _quest_reward(quest_key: str) -> float:
     return next(q["reward_rtc"] for q in bottube_server.DEFAULT_QUESTS if q["quest_key"] == quest_key)
 
@@ -237,3 +251,178 @@ def test_suspicious_comment_reward_is_held_for_review(client):
 
     assert hold_count == 1
     assert comment_earnings == 0
+
+
+def test_admin_ban_defaults_to_coaching_hold_instead_of_ban(client):
+    agent_id = _insert_agent("coachme", "bottube_sk_coachme")
+
+    resp = client.post(
+        "/api/admin/ban",
+        headers={"X-Admin-Key": bottube_server.ADMIN_KEY},
+        json={"agent_name": "coachme", "reason": "repetitive spam pattern"},
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["held_for_review"] == "coachme"
+    assert body["forced"] is False
+
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        is_banned = conn.execute(
+            "SELECT is_banned FROM agents WHERE id = ?",
+            (agent_id,),
+        ).fetchone()[0]
+        hold_count = conn.execute(
+            "SELECT COUNT(*) FROM moderation_holds WHERE target_type = 'agent' AND target_ref = 'coachme'",
+        ).fetchone()[0]
+        moderation_messages = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE to_agent = 'coachme' AND message_type = 'moderation'",
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert is_banned == 0
+    assert hold_count == 1
+    assert moderation_messages == 1
+
+
+def test_report_threshold_queues_hold_without_auto_removal(client):
+    owner_id = _insert_agent("ownerbot", "bottube_sk_ownerbot")
+    _insert_video(owner_id, "ownerclip01A")
+    _insert_agent("reporter1", "bottube_sk_reporter1")
+    _insert_agent("reporter2", "bottube_sk_reporter2")
+    _insert_agent("reporter3", "bottube_sk_reporter3")
+
+    for reporter in ("bottube_sk_reporter1", "bottube_sk_reporter2"):
+        resp = client.post(
+            "/api/videos/ownerclip01A/report",
+            headers={"X-API-Key": reporter},
+            json={"reason": "spam", "details": "low-signal clip"},
+        )
+        assert resp.status_code == 200
+        assert resp.get_json()["flagged_for_review"] is False
+
+    resp = client.post(
+        "/api/videos/ownerclip01A/report",
+        headers={"X-API-Key": "bottube_sk_reporter3"},
+        json={"reason": "spam", "details": "third report"},
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["flagged_for_review"] is True
+
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        video_row = conn.execute(
+            "SELECT is_removed, removed_reason FROM videos WHERE video_id = 'ownerclip01A'",
+        ).fetchone()
+        hold_count = conn.execute(
+            "SELECT COUNT(*) FROM moderation_holds WHERE target_type = 'video' AND target_ref = 'ownerclip01A' AND source = 'community_reports'",
+        ).fetchone()[0]
+        moderation_messages = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE to_agent = 'ownerbot' AND message_type = 'moderation'",
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert video_row[0] == 0
+    assert video_row[1] in ("", None)
+    assert hold_count == 1
+    assert moderation_messages == 1
+
+
+def test_admin_resolve_report_defaults_to_coach_without_deleting_comment(client):
+    owner_id = _insert_agent("commentowner", "bottube_sk_commentowner")
+    reporter_id = _insert_agent("commentreporter", "bottube_sk_commentreporter")
+    _insert_video(owner_id, "commentclip1A")
+    comment_id = _insert_comment(owner_id, "commentclip1A", "same phrase over and over")
+    assert reporter_id > 0
+
+    resp = client.post(
+        f"/api/comments/{comment_id}/report",
+        headers={"X-API-Key": "bottube_sk_commentreporter"},
+        json={"reason": "spam", "details": "repetitive"},
+    )
+    assert resp.status_code == 200
+
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        report_id = conn.execute(
+            "SELECT id FROM reports WHERE comment_id = ? ORDER BY id DESC LIMIT 1",
+            (comment_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    resp = client.post(
+        f"/api/admin/reports/{report_id}/resolve",
+        headers={"X-Admin-Key": bottube_server.ADMIN_KEY},
+        json={},
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["action"] == "coach"
+    assert body["forced"] is False
+
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        comment_exists = conn.execute(
+            "SELECT COUNT(*) FROM comments WHERE id = ?",
+            (comment_id,),
+        ).fetchone()[0]
+        hold_count = conn.execute(
+            "SELECT COUNT(*) FROM moderation_holds WHERE target_type = 'comment' AND target_ref = ? AND source = 'admin_report_resolution'",
+            (str(comment_id),),
+        ).fetchone()[0]
+        report_status = conn.execute(
+            "SELECT status FROM reports WHERE id = ?",
+            (report_id,),
+        ).fetchone()[0]
+        moderation_messages = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE to_agent = 'commentowner' AND message_type = 'moderation'",
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert comment_exists == 1
+    assert hold_count == 1
+    assert report_status == "actioned"
+    assert moderation_messages == 1
+
+
+def test_comment_cleanup_defaults_to_hold_without_deleting(client):
+    agent_id = _insert_agent("cleanupbot", "bottube_sk_cleanupbot")
+    target_id = _insert_agent("cleanupowner", "bottube_sk_cleanupowner")
+    _insert_video(target_id, "cleanupvid1A")
+    first = _insert_comment(agent_id, "cleanupvid1A", "duplicate note", created_at=10.0)
+    second = _insert_comment(agent_id, "cleanupvid1A", "duplicate note", created_at=11.0)
+    assert first != second
+
+    resp = client.post(
+        "/api/admin/comment-cleanup",
+        headers={"X-Admin-Key": bottube_server.ADMIN_KEY},
+        json={"remove_dupes": True, "max_similar": 10},
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["mode"] == "coach_and_hold"
+    assert body["held_duplicates"] >= 1
+    assert body["removed_duplicates"] == 0
+
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        comment_count = conn.execute(
+            "SELECT COUNT(*) FROM comments WHERE agent_id = ? AND video_id = 'cleanupvid1A'",
+            (agent_id,),
+        ).fetchone()[0]
+        hold_count = conn.execute(
+            "SELECT COUNT(*) FROM moderation_holds WHERE target_type = 'comment' AND source = 'comment_cleanup_duplicate'",
+        ).fetchone()[0]
+        moderation_messages = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE to_agent = 'cleanupbot' AND message_type = 'moderation'",
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert comment_count == 2
+    assert hold_count >= 1
+    assert moderation_messages >= 1
