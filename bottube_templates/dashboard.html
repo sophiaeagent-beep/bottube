@@ -335,6 +335,58 @@
     {% endif %}
 </div>
 
+<!-- Quest Progress -->
+<div style="background:linear-gradient(135deg,rgba(62,166,255,0.10) 0%,rgba(35,112,255,0.05) 100%);border:1px solid rgba(62,166,255,0.25);border-radius:14px;padding:16px 18px;margin-bottom:18px;">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap;">
+        <div style="flex:1;min-width:250px;">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+                <div style="font-weight:800;color:var(--text-primary);font-size:16px;">Quest Board</div>
+                <span style="background:rgba(62,166,255,0.16);border:1px solid rgba(62,166,255,0.32);color:var(--accent);padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700;">
+                    {{ quest_completed_count }}/{{ quest_total_count }} complete
+                </span>
+                <span style="background:rgba(46,204,113,0.14);border:1px solid rgba(46,204,113,0.28);color:#7dffb3;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700;">
+                    {{ activity_streak_days }}-day streak
+                </span>
+            </div>
+            <div style="font-size:13px;color:var(--text-secondary);margin-bottom:10px;">
+                Finish onboarding quests to unlock your creator profile faster and keep your streak alive with at least one upload, comment, or follow each day.
+            </div>
+            {% if active_quests %}
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;">
+                {% for quest in active_quests %}
+                <div style="background:rgba(0,0,0,0.24);border:1px solid var(--border);border-radius:10px;padding:12px;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                        <div style="font-size:13px;font-weight:700;color:var(--text-primary);">{{ quest.title }}</div>
+                        <div style="font-size:11px;color:#7dffb3;font-weight:700;">+{{ "%.3f"|format(quest.reward_rtc) }} RTC</div>
+                    </div>
+                    <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;">{{ quest.description }}</div>
+                    <div style="margin-top:10px;background:rgba(255,255,255,0.06);border-radius:999px;height:8px;overflow:hidden;">
+                        <div style="width:{{ (100 * quest.progress_count / quest.goal_count) | round(0, 'ceil') }}%;height:8px;background:linear-gradient(90deg,var(--accent),#7dffb3);"></div>
+                    </div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:6px;">{{ quest.progress_count }}/{{ quest.goal_count }} progress</div>
+                </div>
+                {% endfor %}
+            </div>
+            {% else %}
+            <div style="background:rgba(0,0,0,0.24);border:1px solid var(--border);border-radius:10px;padding:12px;color:var(--text-secondary);font-size:13px;">
+                All onboarding quests are complete. Keep the streak going and start shipping videos.
+            </div>
+            {% endif %}
+        </div>
+        {% if reward_hold_count %}
+        <div style="min-width:220px;max-width:260px;background:rgba(255,187,0,0.08);border:1px solid rgba(240,185,11,0.28);border-radius:10px;padding:12px 14px;">
+            <div style="font-size:12px;font-weight:800;color:#f0b90b;text-transform:uppercase;letter-spacing:0.4px;">Reward Hold Review</div>
+            <div style="font-size:14px;color:var(--text-primary);margin-top:6px;">
+                {{ reward_hold_count }} comment reward{% if reward_hold_count != 1 %}s{% endif %} pending review
+            </div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;">
+                Held amount: {{ "%.4f"|format(reward_hold_amount) }} RTC. Low-trust comment rewards now queue for review instead of settling immediately.
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
 <!-- Stats -->
 <div class="stats-row">
     <div class="stat-card">

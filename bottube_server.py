@@ -490,6 +490,9 @@ RTC_REWARD_UPLOAD = 0.05       # Uploading a video
 RTC_REWARD_VIEW = 0.0001       # Per view (paid to video creator)
 RTC_REWARD_COMMENT = 0.001     # Posting a comment (paid to commenter)
 RTC_REWARD_LIKE_RECEIVED = 0.001  # Receiving a like (paid to video creator)
+COMMENT_REWARD_DAILY_CAP = float(os.environ.get("BOTTUBE_COMMENT_REWARD_DAILY_CAP", "0.02"))
+COMMENT_REWARD_TARGET_DAILY_CAP = float(os.environ.get("BOTTUBE_COMMENT_REWARD_TARGET_DAILY_CAP", "0.005"))
+COMMENT_REWARD_HOLD_THRESHOLD = int(os.environ.get("BOTTUBE_COMMENT_REWARD_HOLD_THRESHOLD", "40"))
 RTC_TIP_MIN = 0.001              # Minimum tip amount
 RTC_TIP_MAX = 100.0              # Maximum tip per transaction
 
@@ -1001,6 +1004,22 @@ CREATE TABLE IF NOT EXISTS earnings (
     FOREIGN KEY (agent_id) REFERENCES agents(id)
 );
 
+CREATE TABLE IF NOT EXISTS reward_holds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    event_ref TEXT NOT NULL,
+    amount REAL NOT NULL,
+    status TEXT DEFAULT 'pending',
+    risk_score INTEGER DEFAULT 0,
+    reasons TEXT DEFAULT '[]',
+    created_at REAL NOT NULL,
+    reviewed_at REAL DEFAULT 0,
+    reviewer_note TEXT DEFAULT '',
+    UNIQUE(agent_id, event_type, event_ref),
+    FOREIGN KEY (agent_id) REFERENCES agents(id)
+);
+
 CREATE TABLE IF NOT EXISTS giveaway_entrants (
     id INTEGER PRIMARY KEY,
     agent_id INTEGER UNIQUE NOT NULL,
@@ -1047,6 +1066,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_video ON comments(video_id);
 CREATE INDEX IF NOT EXISTS idx_views_video ON views(video_id);
 CREATE INDEX IF NOT EXISTS idx_views_dedup ON views(video_id, ip_address, created_at);
 CREATE INDEX IF NOT EXISTS idx_earnings_agent ON earnings(agent_id);
+CREATE INDEX IF NOT EXISTS idx_reward_holds_agent ON reward_holds(agent_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_subs_follower ON subscriptions(follower_id);
 CREATE INDEX IF NOT EXISTS idx_subs_following ON subscriptions(following_id);
 CREATE INDEX IF NOT EXISTS idx_notif_agent ON notifications(agent_id, is_read, created_at DESC);
@@ -1878,6 +1898,171 @@ def award_rtc(db, agent_id: int, amount: float, reason: str, video_id: str = "")
         "INSERT INTO earnings (agent_id, amount, reason, video_id, created_at) VALUES (?, ?, ?, ?, ?)",
         (agent_id, amount, reason, video_id, time.time()),
     )
+
+
+def _queue_reward_hold(
+    db: sqlite3.Connection,
+    *,
+    agent_id: int,
+    event_type: str,
+    event_ref: str,
+    amount: float,
+    risk_score: int,
+    reasons: list[str],
+) -> None:
+    """Persist a suspicious reward instead of paying it immediately."""
+    db.execute(
+        """
+        INSERT INTO reward_holds
+            (agent_id, event_type, event_ref, amount, status, risk_score, reasons, created_at)
+        VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+        ON CONFLICT(agent_id, event_type, event_ref) DO UPDATE SET
+            risk_score = excluded.risk_score,
+            reasons = excluded.reasons
+        """,
+        (agent_id, event_type, event_ref, amount, int(risk_score), json.dumps(reasons), time.time()),
+    )
+
+
+def _comment_reward_decision(
+    db: sqlite3.Connection,
+    *,
+    agent_id: int,
+    video_id: str,
+    comment_id: int,
+    content: str,
+) -> dict:
+    """Score a comment reward and either pay it or hold it for review."""
+    now = time.time()
+    reasons: list[str] = []
+    risk = 0
+    content_norm = " ".join((content or "").strip().lower().split())
+    tokens = re.findall(r"[a-z0-9']+", content_norm)
+    unique_ratio = (len(set(tokens)) / len(tokens)) if tokens else 0.0
+
+    if len(content_norm) < 24:
+        risk += 18
+        reasons.append("comment too short")
+    if tokens and unique_ratio < 0.55:
+        risk += 18
+        reasons.append("low token variety")
+    if re.search(r"(.)\1{5,}", content_norm):
+        risk += 20
+        reasons.append("repeated characters")
+    if "http://" in content_norm or "https://" in content_norm:
+        risk += 18
+        reasons.append("contains outbound link")
+
+    agent_row = db.execute(
+        "SELECT created_at FROM agents WHERE id = ?",
+        (agent_id,),
+    ).fetchone()
+    if agent_row and (now - float(agent_row["created_at"] or now)) < 86400:
+        risk += 12
+        reasons.append("new account")
+
+    recent_hour = db.execute(
+        "SELECT COUNT(*) FROM comments WHERE agent_id = ? AND created_at >= ?",
+        (agent_id, now - 3600),
+    ).fetchone()[0]
+    if int(recent_hour or 0) >= 10:
+        risk += 15
+        reasons.append("high hourly comment velocity")
+
+    same_video_recent = db.execute(
+        "SELECT COUNT(*) FROM comments WHERE agent_id = ? AND video_id = ? AND created_at >= ?",
+        (agent_id, video_id, now - 86400),
+    ).fetchone()[0]
+    if int(same_video_recent or 0) >= 3:
+        risk += 12
+        reasons.append("repeated target video")
+
+    owner_row = db.execute(
+        "SELECT agent_id FROM videos WHERE video_id = ?",
+        (video_id,),
+    ).fetchone()
+    target_agent_id = int(owner_row["agent_id"]) if owner_row else 0
+
+    day_start = now - 86400
+    today_comment_earnings = float(
+        db.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM earnings WHERE agent_id = ? AND reason = 'comment' AND created_at >= ?",
+            (agent_id, day_start),
+        ).fetchone()[0]
+        or 0.0
+    )
+    if today_comment_earnings >= COMMENT_REWARD_DAILY_CAP:
+        risk += 30
+        reasons.append("daily comment reward cap reached")
+
+    target_comment_count = 0
+    if target_agent_id:
+        target_comment_count = int(
+            db.execute(
+                """
+                SELECT COUNT(*)
+                FROM comments c
+                JOIN videos v ON v.video_id = c.video_id
+                WHERE c.agent_id = ?
+                  AND v.agent_id = ?
+                  AND c.created_at >= ?
+                """,
+                (agent_id, target_agent_id, day_start),
+            ).fetchone()[0]
+            or 0
+        )
+    if (target_comment_count * RTC_REWARD_COMMENT) >= COMMENT_REWARD_TARGET_DAILY_CAP:
+        risk += 20
+        reasons.append("same-creator reward cap reached")
+
+    hold = risk >= COMMENT_REWARD_HOLD_THRESHOLD
+    if hold:
+        _queue_reward_hold(
+            db,
+            agent_id=agent_id,
+            event_type="comment",
+            event_ref=str(comment_id),
+            amount=RTC_REWARD_COMMENT,
+            risk_score=risk,
+            reasons=reasons or ["anti-farm hold"],
+        )
+        return {"awarded": False, "held": True, "risk_score": risk, "reasons": reasons}
+
+    award_rtc(db, agent_id, RTC_REWARD_COMMENT, "comment", video_id)
+    return {"awarded": True, "held": False, "risk_score": risk, "reasons": reasons}
+
+
+def _activity_streak_days(db: sqlite3.Connection, agent_id: int) -> int:
+    """Count consecutive days with creator activity."""
+    rows = db.execute(
+        """
+        SELECT day FROM (
+            SELECT strftime('%Y-%m-%d', datetime(created_at, 'unixepoch')) AS day
+            FROM videos WHERE agent_id = ?
+            UNION
+            SELECT strftime('%Y-%m-%d', datetime(created_at, 'unixepoch')) AS day
+            FROM comments WHERE agent_id = ?
+            UNION
+            SELECT strftime('%Y-%m-%d', datetime(created_at, 'unixepoch')) AS day
+            FROM subscriptions WHERE follower_id = ?
+        )
+        ORDER BY day DESC
+        """,
+        (agent_id, agent_id, agent_id),
+    ).fetchall()
+    if not rows:
+        return 0
+
+    active_days = {r["day"] for r in rows if r["day"]}
+    streak = 0
+    day_ts = int(time.time() // 86400) * 86400
+    while True:
+        day = datetime.datetime.utcfromtimestamp(day_ts).strftime("%Y-%m-%d")
+        if day not in active_days:
+            break
+        streak += 1
+        day_ts -= 86400
+    return streak
 
 
 # ---------------------------------------------------------------------------
@@ -3908,13 +4093,18 @@ def add_comment(video_id):
     if existing:
         return jsonify({"error": "Duplicate comment", "existing_id": existing["id"]}), 409
 
-    db.execute(
+    cur = db.execute(
         """INSERT INTO comments (video_id, agent_id, parent_id, content, comment_type, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
         (video_id, g.agent["id"], parent_id, content, comment_type, time.time()),
     )
-    # Award RTC to commenter
-    award_rtc(db, g.agent["id"], RTC_REWARD_COMMENT, "comment", video_id)
+    reward_result = _comment_reward_decision(
+        db,
+        agent_id=g.agent["id"],
+        video_id=video_id,
+        comment_id=int(cur.lastrowid),
+        content=content,
+    )
     # Notify video owner
     video_row = db.execute("SELECT agent_id FROM videos WHERE video_id = ?", (video_id,)).fetchone()
     if video_row:
@@ -3936,11 +4126,18 @@ def add_comment(video_id):
 
     return jsonify({
         "ok": True,
+        "comment_id": int(cur.lastrowid),
+        "reward": {
+            "awarded": bool(reward_result["awarded"]),
+            "held": bool(reward_result["held"]),
+            "risk_score": int(reward_result["risk_score"]),
+            "reasons": reward_result["reasons"],
+        },
         "agent_name": g.agent["agent_name"],
         "content": content,
         "comment_type": comment_type,
         "video_id": video_id,
-        "rtc_earned": RTC_REWARD_COMMENT,
+        "rtc_earned": RTC_REWARD_COMMENT if reward_result["awarded"] else 0.0,
     }), 201
 
 
@@ -7813,7 +8010,19 @@ def dashboard_page():
     ).fetchall()
 
     # RTC balance
-    rtc_balance = g.user.get("rtc_balance", 0) or 0
+    rtc_balance = g.user["rtc_balance"] or 0
+    quest_rows = _refresh_agent_quests(db, uid)
+    quest_active = [q for q in quest_rows if not q["completed"]]
+    quest_completed = sum(1 for q in quest_rows if q["completed"])
+    activity_streak_days = _activity_streak_days(db, uid)
+    reward_holds_row = db.execute(
+        """
+        SELECT COUNT(*) AS hold_count, COALESCE(SUM(amount), 0) AS hold_amount
+        FROM reward_holds
+        WHERE agent_id = ? AND status = 'pending'
+        """,
+        (uid,),
+    ).fetchone()
 
     # BAN balance (from ban_transactions if Banano is enabled)
     ban_balance = 0.0
@@ -7844,6 +8053,7 @@ def dashboard_page():
            ORDER BY created_at DESC LIMIT 10""",
         (uid,),
     ).fetchall()
+    db.commit()
 
     return render_template(
         "dashboard.html",
@@ -7857,6 +8067,13 @@ def dashboard_page():
         ban_balance=ban_balance,
         earnings=earnings,
         referral=referral_data,
+        quests=quest_rows,
+        active_quests=quest_active[:3],
+        quest_completed_count=quest_completed,
+        quest_total_count=len(quest_rows),
+        activity_streak_days=activity_streak_days,
+        reward_hold_count=int(reward_holds_row["hold_count"] or 0),
+        reward_hold_amount=float(reward_holds_row["hold_amount"] or 0),
     )
 
 

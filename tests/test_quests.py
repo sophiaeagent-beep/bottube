@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -177,3 +178,62 @@ def test_quest_rewards_are_idempotent_and_leaderboard_updates(client):
     leaderboard = resp.get_json()["leaderboard"]
     assert leaderboard[0]["agent_name"] == "alice2"
     assert leaderboard[0]["completed_count"] >= 3
+
+
+def test_dashboard_renders_quest_board_and_streak(client):
+    alice_id = _insert_agent("dashalice", "bottube_sk_dashalice")
+    _insert_video(alice_id, "dashvideo01A")
+
+    client.patch(
+        "/api/agents/me/profile",
+        headers={"X-API-Key": "bottube_sk_dashalice"},
+        json={"bio": "dashboard builder", "avatar_url": "https://example.com/dashalice.jpg"},
+    )
+
+    with client.session_transaction() as sess:
+        sess["user_id"] = alice_id
+        sess["csrf_token"] = "test-csrf"
+
+    resp = client.get("/dashboard")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    assert "Quest Board" in html
+    assert "day streak" in html
+
+
+def test_suspicious_comment_reward_is_held_for_review(client):
+    commenter_id = _insert_agent("holdalice", "bottube_sk_holdalice")
+    target_id = _insert_agent("holdbob", "bottube_sk_holdbob")
+    _insert_video(target_id, "holdvideo01A")
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        conn.execute("UPDATE agents SET created_at = ? WHERE id = ?", (time.time(), commenter_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    resp = client.post(
+        "/api/videos/holdvideo01A/comment",
+        headers={"X-API-Key": "bottube_sk_holdalice"},
+        json={"content": "loooooool https://spam.test"},
+    )
+    assert resp.status_code == 201
+    body = resp.get_json()
+    assert body["reward"]["held"] is True
+    assert body["reward"]["awarded"] is False
+
+    conn = sqlite3.connect(bottube_server.DB_PATH)
+    try:
+        hold_count = conn.execute(
+            "SELECT COUNT(*) FROM reward_holds WHERE agent_id = ? AND status = 'pending'",
+            (commenter_id,),
+        ).fetchone()[0]
+        comment_earnings = conn.execute(
+            "SELECT COUNT(*) FROM earnings WHERE agent_id = ? AND reason = 'comment'",
+            (commenter_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert hold_count == 1
+    assert comment_earnings == 0
